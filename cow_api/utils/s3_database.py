@@ -3,7 +3,6 @@ import boto3
 import os
 from botocore.exceptions import ClientError
 import logging
-from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -12,22 +11,19 @@ class S3DatabaseManager:
         """
         Gestionnaire pour la base de données embedding stockée sur S3
         """
-        # Forcer le rechargement des variables d'environnement
-        load_dotenv(override=True)
-        
         self.bucket_name = bucket_name or os.getenv('AWS_S3_BUCKET', 'boviclouds-cows-imgs')
         self.region_name = region_name
         self.db_key = "database/embedding_database.json"
         self.local_cache = "utils/embedding_database_cache.json"
         
-        # Initialisation du client S3 avec session explicite
+        # Initialisation du client S3
         try:
-            session = boto3.Session(
+            self.s3_client = boto3.client(
+                's3',
+                region_name=self.region_name,
                 aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-                region_name=self.region_name
+                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
             )
-            self.s3_client = session.client('s3')
         except Exception as e:
             logger.error(f"Erreur lors de l'initialisation du client S3: {e}")
             raise
@@ -59,12 +55,12 @@ class S3DatabaseManager:
                 self.save_database(new_db)
                 return new_db
             else:
-                # Erreur S3, ne pas utiliser le cache local - faire échouer
-                logger.error(f"Erreur S3: {e}")
-                raise Exception(f"Impossible d'accéder à S3: {e}")
+                # Erreur S3, essayer le cache local
+                logger.warning(f"Erreur S3: {e}, utilisation du cache local")
+                return self._load_local_cache()
         except Exception as e:
             logger.error(f"Erreur lors du chargement depuis S3: {e}")
-            raise Exception(f"Impossible de charger la base de données depuis S3: {e}")
+            return self._load_local_cache()
     
     def save_database(self, database):
         """Sauvegarde la base de données sur S3 et localement"""

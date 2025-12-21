@@ -27,10 +27,12 @@ def save_database(database, path="database.json"):
 
 # Extraire embedding
 def get_embedding(img_tensor):
-    return embedding_model.predict(img_tensor)[0]
+    img_batch = np.expand_dims(img_tensor, axis=0)
+    embedding = model.predict(img_batch, verbose=0)
+    return embedding[0]
 
 # Identifier
-def predict_identity(img_tensor, database, threshold=0.91):
+def predict_identity(img_tensor, database, threshold=0.7):
     # Vérifier si la base de données contient des embeddings
     if not database.get("embeddings") or len(database["embeddings"]) == 0:
         return "BASE_VIDE", 0.0
@@ -41,9 +43,9 @@ def predict_identity(img_tensor, database, threshold=0.91):
     
     query_emb = get_embedding(img_tensor)
     sims = cosine_similarity([query_emb], database["embeddings"])[0]
-    best_score = np.max(sims)
-    best_index = np.argmax(sims)
+    best_score = float(np.max(sims))
+    best_index = int(np.argmax(sims))
     if best_score < threshold:
-        return "INCONNUE", float(best_score)
+        return "INCONNUE", best_score
     else:
-        return database["labels"][best_index], float(best_score)
+        return database["labels"][best_index], best_score
