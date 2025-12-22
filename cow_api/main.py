@@ -1,10 +1,10 @@
 from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import shutil
 import numpy as np
-from utils.image_utils import load_and_preprocess_image, detect_muzzle
+from utils.image_utils import preprocess_image, detect_muzzle
 from utils.embeddings import get_embedding, predict_identity
 from utils.s3_database import db_manager, load_database, save_database
 from utils.aws_utils import S3Manager
@@ -12,41 +12,12 @@ import cv2
 import logging
 from dotenv import load_dotenv
 from datetime import datetime
-import sys
-import io
-from PIL import Image, ImageDraw, ImageFont
 
 # Charger les variables d'environnement
-load_dotenv(override=True)
+load_dotenv()
 
 # Configuration des logs
 logging.basicConfig(level=logging.INFO)
-
-# Debug: Vérifier les credentials
-logging.info(f"🔑 Access Key: {os.getenv('AWS_ACCESS_KEY_ID')}")
-logging.info(f"🌍 Region: {os.getenv('AWS_REGION')}")
-
-# Vérification critique de S3 au démarrage
-try:
-    logging.info("🔍 Vérification de la connectivité S3...")
-    
-    # Vérifier les variables d'environnement AWS
-    required_vars = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing_vars:
-        raise Exception(f"Variables d'environnement manquantes: {', '.join(missing_vars)}")
-    
-    # Tester la connexion S3
-    s3_manager = S3Manager()
-    s3_manager.s3_client.head_bucket(Bucket=s3_manager.bucket_name)
-    
-    logging.info("✅ S3 accessible - démarrage de l'API")
-    
-except Exception as e:
-    logging.critical(f"❌ ERREUR S3: {e}")
-    logging.critical("🚫 L'API ne peut pas démarrer sans accès S3")
-    sys.exit(1)
 
 app = FastAPI()
 
@@ -63,11 +34,11 @@ app.add_middleware(
 database = load_database()
 logging.info(f"Base de données chargée avec {len(database.get('labels', []))} vaches")
 
-# Initialisation du gestionnaire S3 (déjà vérifié au démarrage)
-# s3_manager déjà initialisé lors de la vérification
+# Initialisation du gestionnaire S3
+s3_manager = S3Manager()
 
 # Créer les dossiers nécessaires pour la sauvegarde des prédictions
-os.makedirs("prediction_results", exist_ok=True)
+os.makedirs("data/prediction_results", exist_ok=True)
 
 # Créer le bucket S3 si nécessaire au démarrage
 try:
@@ -97,7 +68,7 @@ async def add_cow(cow_id: str = Form(...)):
         os.makedirs(temp_folder, exist_ok=True)
         
         # Créer un dossier local pour sauvegarder les museaux détectés
-        muzzle_folder = f"muzzle_images/{cow_id}"
+        muzzle_folder = f"data/muzzle_images/{cow_id}"
         os.makedirs(muzzle_folder, exist_ok=True)
 
         try:
@@ -111,14 +82,8 @@ async def add_cow(cow_id: str = Form(...)):
                     logging.warning(f"Échec du téléchargement de {s3_image_key}")
                     continue
 
-                # Charger et traiter l'image
-                img_cv = cv2.imread(local_image_path)
-                if img_cv is None:
-                    logging.warning(f"Impossible de charger l'image {local_image_path}")
-                    continue
-
                 # Détecter le museau
-                muzzle_img = detect_muzzle(img_cv, 0.3)
+                muzzle_img = detect_muzzle(local_image_path)
                 if muzzle_img is None:
                     logging.info(f"Museau non détecté dans l'image {s3_image_key}")
                     continue
@@ -131,7 +96,7 @@ async def add_cow(cow_id: str = Form(...)):
                 logging.info(f"Museau sauvegardé: {muzzle_path}")
 
                 # Traitement pour les embeddings seulement (pas de sauvegarde)
-                img_tensor = load_and_preprocess_image(muzzle_img)
+                img_tensor = preprocess_image(muzzle_img)
                 emb = get_embedding(img_tensor)
                 embeddings.append(emb)
                 logging.info(f"Embedding extrait de {s3_image_key}")
@@ -176,54 +141,20 @@ async def add_cow(cow_id: str = Form(...)):
 
 
 
-@app.post("/predict", 
-          summary="Prédiction d'identité de vache",
-          description="Prédit l'identité d'une vache à partir d'une seule image. L'image doit contenir un museau de vache visible.")
-async def predict(image: UploadFile = File(..., description="Une seule image de vache (formats supportés: JPG, PNG, etc.)")):
-    """Prédiction d'identité de vache à partir d'une seule image"""
+@app.post("/predict")
+async def predict(image: UploadFile = File(...)):
     global database
-    
-    # Validation du type de fichier
-    if not image.content_type.startswith('image/'):
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Le fichier doit être une image (jpg, png, etc.)"}
-        )
-    
-    # Validation de la taille du fichier (max 10MB)
-    max_size = 10 * 1024 * 1024  # 10MB
-    if hasattr(image, 'size') and image.size > max_size:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "La taille de l'image ne doit pas dépasser 10MB"}
-        )
-    
     filename_only = os.path.basename(image.filename)
     temp_path = f"temp_{filename_only}"
-    
-    try:
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(image.file, buffer)
-    except Exception as e:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Erreur lors de la lecture du fichier: {str(e)}"}
-        )
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(image.file, buffer)
 
-    try:
-        img_cv = cv2.imread(temp_path)
-        if img_cv is None:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Impossible de lire l'image. Format non supporté."}
-            )
-    finally:
-        # Nettoyer le fichier temporaire même en cas d'erreur
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
 
     # Détection du museau
-    muzzle_img = detect_muzzle(img_cv)
+    muzzle_img = detect_muzzle(temp_path)
+
+    os.remove(temp_path)
+
     if muzzle_img is None:
         return JSONResponse({
             "prediction": "MUSEAU NON DÉTECTÉ",
@@ -232,16 +163,16 @@ async def predict(image: UploadFile = File(..., description="Une seule image de 
         })
     
     # Générer un nom de fichier unique avec timestamp
-    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # microseconds tronquées
-    # muzzle_filename = f"prediction_{timestamp}_{filename_only}"
-    # muzzle_save_path = os.path.join("prediction_results", muzzle_filename)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # microseconds tronquées
+    muzzle_filename = f"prediction_{timestamp}_{filename_only}"
+    muzzle_save_path = os.path.join("data/prediction_results", muzzle_filename)
     
-    # # Sauvegarder l'image du museau détecté
-    # cv2.imwrite(muzzle_save_path, muzzle_img)
-    # logging.info(f"Museau détecté sauvegardé: {muzzle_save_path}")
+    # Sauvegarder l'image du museau détecté
+    cv2.imwrite(muzzle_save_path, muzzle_img)
+    logging.info(f"Museau détecté sauvegardé: {muzzle_save_path}")
     
-    img_tensor = load_and_preprocess_image(muzzle_img)
-    label, score = predict_identity(img_tensor, database)
+    img_tensor = preprocess_image(muzzle_img)
+    label, score = predict_identity(img_tensor, database, threshold=0.7)
 
     # Gestion du cas où la base de données est vide
     if label == "BASE_VIDE":
@@ -249,7 +180,7 @@ async def predict(image: UploadFile = File(..., description="Une seule image de 
             "prediction": "BASE DE DONNÉES VIDE",
             "score": 0.0,
             "muzzle_saved": True,
-            # "muzzle_save_path": muzzle_save_path,
+            "muzzle_save_path": muzzle_save_path,
             "original_filename": filename_only,
             "message": "Aucune vache enregistrée dans la base de données. Ajoutez des vaches avec /add-cow avant de faire des prédictions.",
             "total_cows_in_database": len(database.get("labels", []))
@@ -259,191 +190,10 @@ async def predict(image: UploadFile = File(..., description="Une seule image de 
         "prediction": label,
         "score": float(score),
         "muzzle_saved": True,
-        # "muzzle_save_path": muzzle_save_path,
+        "muzzle_save_path": muzzle_save_path,
         "original_filename": filename_only,
         "total_cows_in_database": len(database.get("labels", []))
     })
-
-
-@app.post("/demo", 
-          summary="Endpoint de démonstration avec image annotée",
-          description="Traite une image de vache, détecte le museau, fait la prédiction et retourne l'image originale avec le museau encadré et l'ID affiché.")
-async def demo(image: UploadFile = File(..., description="Image de vache pour la démonstration")):
-    """Endpoint demo qui retourne l'image avec annotation visuelle pour la présentation"""
-    global database
-    
-    # Validation du type de fichier
-    if not image.content_type.startswith('image/'):
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Le fichier doit être une image (jpg, png, etc.)"}
-        )
-    
-    filename_only = os.path.basename(image.filename)
-    temp_path = f"temp_demo_{filename_only}"
-    
-    try:
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(image.file, buffer)
-    except Exception as e:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Erreur lors de la lecture du fichier: {str(e)}"}
-        )
-
-    try:
-        # Charger l'image originale
-        img_cv = cv2.imread(temp_path)
-        if img_cv is None:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Impossible de lire l'image. Format non supporté."}
-            )
-        
-        # Convertir en PIL pour le traitement
-        img_pil = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
-        draw = ImageDraw.Draw(img_pil)
-        
-        # Détecter le museau avec les coordonnées
-        from ultralytics import YOLO
-        yolo_model = YOLO("utils/new.pt")
-        results = list(yolo_model(img_cv, conf=0.05))
-        boxes = results[0].boxes
-        
-        if boxes is not None and len(boxes) > 0:
-            # Obtenir les coordonnées du museau
-            box = boxes[0]
-            x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-            
-            # Extraire le museau pour la prédiction
-            muzzle_img = img_cv[y1:y2, x1:x2]
-            
-            # Faire la prédiction
-            img_tensor = load_and_preprocess_image(muzzle_img)
-            label, score = predict_identity(img_tensor, database)
-            
-            # Dessiner le rectangle autour du museau (plus épais pour la démo)
-            rectangle_color = (0, 255, 0) if score > 0.7 else (255, 165, 0) if score > 0.5 else (255, 0, 0)
-            draw.rectangle([x1, y1, x2, y2], outline=rectangle_color, width=10)
-            
-            # Préparer le texte à afficher
-            if label == "BASE_VIDE":
-                display_text = "Base vide"
-                confidence_text = ""
-            else:
-                display_text = f"ID: {label}"
-                confidence_text = f"Confiance: {score:.1%}"
-            
-            # Essayer de charger une police encore plus grande pour la démo
-            try:
-                font_large = ImageFont.truetype("arial.ttf", 96)  # Encore plus grand
-                font_small = ImageFont.truetype("arial.ttf", 64)  # Encore plus grand
-            except:
-                try:
-                    font_large = ImageFont.load_default()
-                    font_small = ImageFont.load_default()
-                except:
-                    font_large = None
-                    font_small = None
-            
-            # Position pour le texte (directement au-dessus du rectangle du museau avec un petit espace stylé)
-            text_gap = 20  # Petit espace stylé entre le texte et le rectangle
-            text_height_needed = 120 + (100 if confidence_text else 0)  # Hauteur du texte + espacement
-            
-            # Placer le texte directement au-dessus du rectangle avec un petit gap
-            text_y = max(30, y1 - text_height_needed - text_gap)
-            
-            # Créer un fond pour le texte (encore plus grand pour la démo)
-            # S'assurer que le texte commence au niveau du rectangle du museau ou avant
-            text_x = max(30, x1)  # Aligner avec le rectangle du museau ou un minimum de marge
-            
-            text_bbox = draw.textbbox((text_x, text_y), display_text, font=font_large) if font_large else (text_x, text_y, text_x+500, text_y+120)
-            bg_padding = 30  # Encore plus de padding
-            bg_coords = [
-                text_bbox[0] - bg_padding,
-                text_bbox[1] - bg_padding,
-                text_bbox[2] + bg_padding,
-                text_bbox[3] + bg_padding + (100 if confidence_text else 0)  # Encore plus d'espace pour le texte de confiance
-            ]
-            
-            # Dessiner le fond semi-transparent (plus opaque pour meilleure lisibilité)
-            overlay = Image.new('RGBA', img_pil.size, (255, 255, 255, 0))
-            overlay_draw = ImageDraw.Draw(overlay)
-            overlay_draw.rectangle(bg_coords, fill=(0, 0, 0, 220))  # Plus opaque
-            img_pil = Image.alpha_composite(img_pil.convert('RGBA'), overlay).convert('RGB')
-            draw = ImageDraw.Draw(img_pil)
-            
-            # Dessiner le texte principal (utiliser text_x au lieu de x1)
-            if font_large:
-                draw.text((text_x, text_y), display_text, fill=(255, 255, 255), font=font_large)
-            else:
-                draw.text((text_x, text_y), display_text, fill=(255, 255, 255))
-            
-            # Dessiner le texte de confiance (avec encore plus d'espace, utiliser text_x)
-            if confidence_text and font_small:
-                draw.text((text_x, text_y + 120), confidence_text, fill=(200, 200, 200), font=font_small)
-            elif confidence_text:
-                draw.text((text_x, text_y + 80), confidence_text, fill=(200, 200, 200))
-            
-        else:
-            # Aucun museau détecté - texte encore plus grand pour la démo
-            display_text = "MUSEAU NON DÉTECTÉ"
-            try:
-                font_large = ImageFont.truetype("arial.ttf", 100)  # Très grand
-            except:
-                font_large = None
-            
-            # Centrer le texte
-            img_width, img_height = img_pil.size
-            if font_large:
-                text_bbox = draw.textbbox((0, 0), display_text, font=font_large)
-                text_width = text_bbox[2] - text_bbox[0]
-                text_height = text_bbox[3] - text_bbox[1]
-            else:
-                text_width, text_height = 800, 120  # Encore plus grand par défaut
-            
-            text_x = (img_width - text_width) // 2
-            text_y = img_height // 2 - text_height // 2
-            
-            # Fond pour le texte (encore plus grand)
-            bg_coords = [text_x - 60, text_y - 60, text_x + text_width + 60, text_y + text_height + 60]
-            overlay = Image.new('RGBA', img_pil.size, (255, 255, 255, 0))
-            overlay_draw = ImageDraw.Draw(overlay)
-            overlay_draw.rectangle(bg_coords, fill=(255, 0, 0, 220))  # Légèrement plus opaque
-            img_pil = Image.alpha_composite(img_pil.convert('RGBA'), overlay).convert('RGB')
-            draw = ImageDraw.Draw(img_pil)
-            
-            # Texte
-            if font_large:
-                draw.text((text_x, text_y), display_text, fill=(255, 255, 255), font=font_large)
-            else:
-                draw.text((text_x, text_y), display_text, fill=(255, 255, 255))
-        
-        # Convertir l'image en bytes pour la réponse
-        img_byte_arr = io.BytesIO()
-        img_pil.save(img_byte_arr, format='JPEG', quality=95)
-        img_byte_arr.seek(0)
-        
-        return Response(
-            content=img_byte_arr.getvalue(),
-            media_type="image/jpeg",
-            headers={
-                "Content-Disposition": f"inline; filename=demo_{filename_only}",
-                "X-Prediction": label if 'label' in locals() else "MUSEAU_NON_DETECTE",
-                "X-Score": str(score) if 'score' in locals() else "0"
-            }
-        )
-        
-    except Exception as e:
-        logging.error(f"Erreur dans l'endpoint demo: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Erreur lors du traitement: {str(e)}"}
-        )
-    finally:
-        # Nettoyer le fichier temporaire
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
 
 
 @app.get("/cow/{cow_id}/raw-images")
@@ -467,7 +217,7 @@ async def get_cow_raw_images(cow_id: str):
 @app.get("/cow/{cow_id}/muzzle-images")
 async def get_cow_muzzle_images(cow_id: str):
     """Récupère la liste des images de museaux sauvegardées localement"""
-    muzzle_folder = f"muzzle_images/{cow_id}"
+    muzzle_folder = f"data/muzzle_images/{cow_id}"
     
     if not os.path.exists(muzzle_folder):
         return JSONResponse(
@@ -528,19 +278,19 @@ async def delete_cow(cow_id: str):
         save_success = save_database(database)
         
         # Supprimer le dossier local des images de museaux s'il existe
-        muzzle_folder = f"muzzle_images/{cow_id}"
-        muzzle_files_deleted = 0
-        if os.path.exists(muzzle_folder):
-            try:
-                # Compter les fichiers avant suppression
-                muzzle_files = [f for f in os.listdir(muzzle_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-                muzzle_files_deleted = len(muzzle_files)
+        # muzzle_folder = f"data/muzzle_images/{cow_id}"
+        # muzzle_files_deleted = 0
+        # if os.path.exists(muzzle_folder):
+        #     try:
+        #         # Compter les fichiers avant suppression
+        #         muzzle_files = [f for f in os.listdir(muzzle_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        #         muzzle_files_deleted = len(muzzle_files)
                 
-                # Supprimer le dossier et son contenu
-                shutil.rmtree(muzzle_folder)
-                logging.info(f"Dossier de museaux {muzzle_folder} supprimé avec {muzzle_files_deleted} fichiers")
-            except Exception as e:
-                logging.warning(f"Impossible de supprimer le dossier {muzzle_folder}: {e}")
+        #         # Supprimer le dossier et son contenu
+        #         shutil.rmtree(muzzle_folder)
+        #         logging.info(f"Dossier de museaux {muzzle_folder} supprimé avec {muzzle_files_deleted} fichiers")
+        #     except Exception as e:
+        #         logging.warning(f"Impossible de supprimer le dossier {muzzle_folder}: {e}")
         
         return {
             "message": f"✅ Vache {cow_id} supprimée avec succès",
@@ -549,8 +299,8 @@ async def delete_cow(cow_id: str):
             "database_saved_to_s3": save_success,
             "backup_created": backup_key is not None,
             "backup_location": f"s3://{db_manager.bucket_name}/{backup_key}" if backup_key else None,
-            "muzzle_folder_deleted": os.path.exists(f"muzzle_images/{cow_id}") == False,
-            "muzzle_files_deleted": muzzle_files_deleted,
+            "muzzle_folder_deleted": os.path.exists(f"data/muzzle_images/{cow_id}") == False,
+            # "muzzle_files_deleted": muzzle_files_deleted,
             "remaining_cows_in_database": len(database.get("labels", []))
         }
         
@@ -575,7 +325,7 @@ async def list_all_cows():
         cows_info = []
         for i, cow_id in enumerate(labels):
             # Vérifier si le dossier de museaux existe localement
-            muzzle_folder = f"muzzle_images/{cow_id}"
+            muzzle_folder = f"data/muzzle_images/{cow_id}"
             muzzle_files_count = 0
             if os.path.exists(muzzle_folder):
                 muzzle_files = [f for f in os.listdir(muzzle_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
