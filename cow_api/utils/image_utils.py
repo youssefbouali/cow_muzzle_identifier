@@ -5,7 +5,7 @@ from ultralytics import YOLO
 from PIL import Image
 import logging
 
-yolo_model = YOLO("utils/new.pt")
+yolo_model = YOLO("utils/last.pt")
 
 
 def preprocess_image(img_np):
