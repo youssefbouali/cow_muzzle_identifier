@@ -6,12 +6,12 @@ import shutil
 import numpy as np
 from utils.image_utils import preprocess_image, detect_muzzle
 from utils.embeddings import get_embedding, predict_identity
-from utils.s3_database import db_manager, load_database, save_database
-from utils.aws_utils import S3Manager
+from utils.local_database import db_manager, load_database, save_database
 import cv2
 import logging
 from dotenv import load_dotenv
 from datetime import datetime
+from typing import List
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -30,107 +30,92 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Charger la base de données depuis S3 au démarrage
+# Charger la base de données locale au démarrage
 database = load_database()
 logging.info(f"Base de données chargée avec {len(database.get('labels', []))} vaches")
 
-# Initialisation du gestionnaire S3
-s3_manager = S3Manager()
-
-# Créer les dossiers nécessaires pour la sauvegarde des prédictions
+# Créer les dossiers nécessaires
 os.makedirs("data/prediction_results", exist_ok=True)
-
-# Créer le bucket S3 si nécessaire au démarrage
-try:
-    s3_manager.create_bucket_if_not_exists()
-except Exception as e:
-    logging.error(f"Impossible d'initialiser S3: {e}")
-    # L'application peut continuer, mais les uploads échoueront
+os.makedirs("data/raw_images", exist_ok=True)
+os.makedirs("data/muzzle_images", exist_ok=True)
 
 @app.post("/add-cow")
-async def add_cow(cow_id: str = Form(...)):
+async def add_cow(
+    cow_id: str = Form(...),
+    images: List[UploadFile] = File(...)
+):
     global database
     embeddings = []
 
     try:
-        # Récupérer la liste des images depuis S3 pour cette vache
-        s3_images = s3_manager.list_cow_raw_images(cow_id)
-        
-        if not s3_images:
-            return JSONResponse(status_code=404, content={
-                "error": f"Aucune image trouvée pour la vache {cow_id} dans le bucket S3."
+        if not images or len(images) == 0:
+            return JSONResponse(status_code=400, content={
+                "error": "Aucune image fournie"
             })
 
-        logging.info(f"Traitement de {len(s3_images)} images pour la vache {cow_id}")
+        logging.info(f"Traitement de {len(images)} images pour la vache {cow_id}")
 
-        # Créer un dossier temporaire local pour le traitement
-        temp_folder = f"temp_processing_{cow_id}"
-        os.makedirs(temp_folder, exist_ok=True)
-        
-        # Créer un dossier local pour sauvegarder les museaux détectés
+        # Créer les dossiers pour cette vache
+        raw_images_folder = f"data/raw_images/{cow_id}"
         muzzle_folder = f"data/muzzle_images/{cow_id}"
+        os.makedirs(raw_images_folder, exist_ok=True)
         os.makedirs(muzzle_folder, exist_ok=True)
 
-        try:
-            muzzle_count = 0
-            for i, s3_image_key in enumerate(s3_images):
-                # Télécharger l'image depuis S3
-                local_image_path = os.path.join(temp_folder, f"image_{i}.jpg")
-                success = s3_manager.download_image(s3_image_key, local_image_path)
-                
-                if not success:
-                    logging.warning(f"Échec du téléchargement de {s3_image_key}")
-                    continue
+        muzzle_count = 0
+        images_saved = 0
+        
+        for i, image in enumerate(images):
+            # Sauvegarder l'image brute
+            raw_image_path = os.path.join(raw_images_folder, f"{cow_id}_{i:03d}_{image.filename}")
+            with open(raw_image_path, "wb") as buffer:
+                shutil.copyfileobj(image.file, buffer)
+            images_saved += 1
+            logging.info(f"Image brute sauvegardée: {raw_image_path}")
 
-                # Détecter le museau
-                muzzle_img = detect_muzzle(local_image_path)
-                if muzzle_img is None:
-                    logging.info(f"Museau non détecté dans l'image {s3_image_key}")
-                    continue
+            # Détecter le museau
+            muzzle_img = detect_muzzle(raw_image_path)
+            if muzzle_img is None:
+                logging.info(f"Museau non détecté dans l'image {image.filename}")
+                continue
 
-                # Sauvegarder l'image du museau localement
-                muzzle_filename = f"muzzle_{cow_id}_{muzzle_count:03d}.jpg"
-                muzzle_path = os.path.join(muzzle_folder, muzzle_filename)
-                cv2.imwrite(muzzle_path, muzzle_img)
-                muzzle_count += 1
-                logging.info(f"Museau sauvegardé: {muzzle_path}")
+            # Sauvegarder l'image du museau
+            muzzle_filename = f"muzzle_{cow_id}_{muzzle_count:03d}.jpg"
+            muzzle_path = os.path.join(muzzle_folder, muzzle_filename)
+            cv2.imwrite(muzzle_path, muzzle_img)
+            muzzle_count += 1
+            logging.info(f"Museau sauvegardé: {muzzle_path}")
 
-                # Traitement pour les embeddings seulement (pas de sauvegarde)
-                img_tensor = preprocess_image(muzzle_img)
-                emb = get_embedding(img_tensor)
-                embeddings.append(emb)
-                logging.info(f"Embedding extrait de {s3_image_key}")
-
-        finally:
-            # Nettoyage du dossier temporaire local
-            try:
-                shutil.rmtree(temp_folder)
-                logging.info(f"Dossier temporaire {temp_folder} supprimé")
-            except Exception as e:
-                logging.warning(f"Impossible de supprimer le dossier temporaire {temp_folder}: {e}")
+            # Extraire l'embedding
+            img_tensor = preprocess_image(muzzle_img)
+            emb = get_embedding(img_tensor)
+            embeddings.append(emb)
+            logging.info(f"Embedding extrait de {image.filename}")
 
         if len(embeddings) == 0:
             return JSONResponse(status_code=400, content={
                 "error": "Aucune image valide (museau non détecté) trouvée.",
-                "images_found": len(s3_images)
+                "images_uploaded": len(images),
+                "images_saved": images_saved
             })
 
-        # Moyenne des embeddings et sauvegarde dans la base de données S3
+        # Moyenne des embeddings et sauvegarde dans la base de données locale
         avg_embedding = np.mean(embeddings, axis=0)
         database["labels"].append(cow_id)
         database["embeddings"].append(avg_embedding.tolist())
         
-        # Sauvegarder sur S3
+        # Sauvegarder localement
         save_success = save_database(database)
         
         return {
             "message": f"✅ Vache {cow_id} ajoutée avec {len(embeddings)} images valides (museau détecté).",
-            "images_found_in_s3": len(s3_images),
+            "images_uploaded": len(images),
+            "images_saved": images_saved,
             "images_with_muzzle_detected": len(embeddings),
             "embeddings_extracted": len(embeddings),
-            "muzzle_images_saved_to": muzzle_folder,
+            "raw_images_folder": raw_images_folder,
+            "muzzle_images_folder": muzzle_folder,
             "muzzle_files_count": muzzle_count,
-            "database_saved_to_s3": save_success
+            "database_saved": save_success
         }
 
     except Exception as e:
@@ -198,19 +183,29 @@ async def predict(image: UploadFile = File(...)):
 
 @app.get("/cow/{cow_id}/raw-images")
 async def get_cow_raw_images(cow_id: str):
-    """Récupère la liste des images brutes d'une vache stockées sur S3"""
+    """Récupère la liste des images brutes d'une vache stockées localement"""
+    raw_folder = f"data/raw_images/{cow_id}"
+    
+    if not os.path.exists(raw_folder):
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Aucune image brute trouvée pour la vache {cow_id}"}
+        )
+    
     try:
-        raw_keys = s3_manager.list_cow_raw_images(cow_id)
-        raw_urls = [f"https://{s3_manager.bucket_name}.s3.{s3_manager.region_name}.amazonaws.com/{key}" for key in raw_keys]
+        raw_files = [f for f in os.listdir(raw_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        raw_files.sort()
+        
         return {
             "cow_id": cow_id,
-            "raw_images_count": len(raw_urls),
-            "s3_urls": raw_urls
+            "raw_images_count": len(raw_files),
+            "raw_folder": raw_folder,
+            "raw_files": raw_files
         }
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"error": f"Erreur lors de la récupération des images brutes: {str(e)}"}
+            content={"error": f"Erreur lors de la lecture du dossier: {str(e)}"}
         )
 
 
@@ -262,8 +257,8 @@ async def delete_cow(cow_id: str):
         cow_index = labels.index(cow_id)
         
         # Créer une sauvegarde avant suppression
-        backup_key = db_manager.backup_database()
-        if not backup_key:
+        backup_path = db_manager.backup_database()
+        if not backup_path:
             logging.warning("Impossible de créer une sauvegarde avant suppression")
         
         # Supprimer la vache et son embedding de la base de données
@@ -277,30 +272,41 @@ async def delete_cow(cow_id: str):
         # Sauvegarder la base de données mise à jour
         save_success = save_database(database)
         
-        # Supprimer le dossier local des images de museaux s'il existe
-        # muzzle_folder = f"data/muzzle_images/{cow_id}"
-        # muzzle_files_deleted = 0
-        # if os.path.exists(muzzle_folder):
-        #     try:
-        #         # Compter les fichiers avant suppression
-        #         muzzle_files = [f for f in os.listdir(muzzle_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-        #         muzzle_files_deleted = len(muzzle_files)
-                
-        #         # Supprimer le dossier et son contenu
-        #         shutil.rmtree(muzzle_folder)
-        #         logging.info(f"Dossier de museaux {muzzle_folder} supprimé avec {muzzle_files_deleted} fichiers")
-        #     except Exception as e:
-        #         logging.warning(f"Impossible de supprimer le dossier {muzzle_folder}: {e}")
+        # Supprimer le dossier local des images brutes
+        raw_folder = f"data/raw_images/{cow_id}"
+        raw_files_deleted = 0
+        if os.path.exists(raw_folder):
+            try:
+                raw_files = [f for f in os.listdir(raw_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                raw_files_deleted = len(raw_files)
+                shutil.rmtree(raw_folder)
+                logging.info(f"Dossier d'images brutes {raw_folder} supprimé avec {raw_files_deleted} fichiers")
+            except Exception as e:
+                logging.warning(f"Impossible de supprimer le dossier {raw_folder}: {e}")
+        
+        # Supprimer le dossier local des images de museaux
+        muzzle_folder = f"data/muzzle_images/{cow_id}"
+        muzzle_files_deleted = 0
+        if os.path.exists(muzzle_folder):
+            try:
+                muzzle_files = [f for f in os.listdir(muzzle_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                muzzle_files_deleted = len(muzzle_files)
+                shutil.rmtree(muzzle_folder)
+                logging.info(f"Dossier de museaux {muzzle_folder} supprimé avec {muzzle_files_deleted} fichiers")
+            except Exception as e:
+                logging.warning(f"Impossible de supprimer le dossier {muzzle_folder}: {e}")
         
         return {
             "message": f"✅ Vache {cow_id} supprimée avec succès",
             "cow_id": cow_id,
             "embedding_removed": True,
-            "database_saved_to_s3": save_success,
-            "backup_created": backup_key is not None,
-            "backup_location": f"s3://{db_manager.bucket_name}/{backup_key}" if backup_key else None,
-            "muzzle_folder_deleted": os.path.exists(f"data/muzzle_images/{cow_id}") == False,
-            # "muzzle_files_deleted": muzzle_files_deleted,
+            "database_saved": save_success,
+            "backup_created": backup_path is not None,
+            "backup_location": backup_path if backup_path else None,
+            "raw_folder_deleted": not os.path.exists(raw_folder),
+            "raw_files_deleted": raw_files_deleted,
+            "muzzle_folder_deleted": not os.path.exists(muzzle_folder),
+            "muzzle_files_deleted": muzzle_files_deleted,
             "remaining_cows_in_database": len(database.get("labels", []))
         }
         
@@ -355,21 +361,12 @@ async def list_all_cows():
 
 @app.get("/health")
 async def health_check():
-    """Vérification de l'état de l'API et de la connectivité S3"""
-    try:
-        # Test de connectivité S3
-        s3_manager.s3_client.head_bucket(Bucket=s3_manager.bucket_name)
-        s3_status = "OK"
-    except Exception as e:
-        s3_status = f"ERROR: {str(e)}"
-    
+    """Vérification de l'état de l'API"""
     # Informations sur la base de données
     db_info = db_manager.get_database_info()
     
     return {
         "api_status": "OK",
-        "s3_status": s3_status,
-        "bucket_name": s3_manager.bucket_name,
         "database_loaded": len(database.get("labels", [])) > 0,
         "database_info": db_info,
         "total_cows_in_database": len(database.get("labels", []))
@@ -384,8 +381,7 @@ async def get_database_info():
     return {
         "total_cows": len(database.get("labels", [])),
         "cow_ids": database.get("labels", []),
-        "storage_location": f"s3://{db_manager.bucket_name}/{db_manager.db_key}",
-        "local_cache": db_manager.local_cache,
+        "storage_location": db_manager.db_path,
         "database_details": db_info
     }
 
@@ -393,12 +389,11 @@ async def get_database_info():
 @app.post("/database/backup")
 async def create_database_backup():
     """Créer une sauvegarde manuelle de la base de données"""
-    backup_key = db_manager.backup_database()
-    if backup_key:
+    backup_path = db_manager.backup_database()
+    if backup_path:
         return {
             "message": "Backup créé avec succès",
-            "backup_location": f"s3://{db_manager.bucket_name}/{backup_key}",
-            "backup_key": backup_key
+            "backup_location": backup_path
         }
     else:
         return JSONResponse(
@@ -409,12 +404,12 @@ async def create_database_backup():
 
 @app.post("/database/reload")
 async def reload_database():
-    """Recharge la base de données depuis S3"""
+    """Recharge la base de données depuis le fichier local"""
     global database
     try:
         database = load_database()
         return {
-            "message": "Base de données rechargée depuis S3",
+            "message": "Base de données rechargée depuis le fichier local",
             "total_cows": len(database.get("labels", [])),
             "cow_ids": database.get("labels", [])
         }

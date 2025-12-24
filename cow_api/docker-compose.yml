@@ -3,9 +3,6 @@ services:
     build: .
     ports:
       - "8000:8000"
-    environment:
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_S3_BUCKET=${AWS_S3_BUCKET:-cow-muzzle-images}
-      - AWS_REGION=${AWS_REGION:-us-east-1}
+    volumes:
+      - ./data:/app/data
     restart: unless-stopped

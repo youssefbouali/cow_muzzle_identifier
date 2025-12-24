@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Créer les dossiers nécessaires
-RUN mkdir -p muzzle_images prediction_results
+RUN mkdir -p data/muzzle_images data/prediction_results data/raw_images
 
 # Exposer le port
 EXPOSE 8000
