@@ -326,21 +326,27 @@ async def delete_cow(farm_id: str, cow_id: str):
                 content={"error": f"Vache {cow_id} non trouvée dans la base de données de l'exploitation {farm_id}"}
             )
         
-        # Trouver l'index de la vache dans la base de données
-        cow_index = labels.index(cow_id)
+        # Compter le nombre d'embeddings de cette vache
+        embeddings_count = labels.count(cow_id)
+        logging.info(f"Suppression de {embeddings_count} embedding(s) pour la vache {cow_id}")
         
         # Créer une sauvegarde avant suppression
         backup_path = db_manager.backup_database(farm_id)
         if not backup_path:
             logging.warning("Impossible de créer une sauvegarde avant suppression")
         
-        # Supprimer la vache et son embedding de la base de données
-        labels.pop(cow_index)
-        embeddings.pop(cow_index)
+        # Supprimer TOUS les embeddings de cette vache
+        # Créer de nouvelles listes sans les entrées de cette vache
+        new_labels = []
+        new_embeddings = []
+        for i, label in enumerate(labels):
+            if label != cow_id:
+                new_labels.append(label)
+                new_embeddings.append(embeddings[i])
         
         # Mettre à jour la base de données
-        database["labels"] = labels
-        database["embeddings"] = embeddings
+        database["labels"] = new_labels
+        database["embeddings"] = new_embeddings
         
         # Mettre à jour le cache
         databases_cache[farm_id] = database
@@ -376,7 +382,7 @@ async def delete_cow(farm_id: str, cow_id: str):
             "message": f"✅ Vache {cow_id} supprimée avec succès de l'exploitation {farm_id}",
             "farm_id": farm_id,
             "cow_id": cow_id,
-            "embedding_removed": True,
+            "embeddings_removed": embeddings_count,
             "database_saved": save_success,
             "backup_created": backup_path is not None,
             "backup_location": backup_path if backup_path else None,
@@ -384,7 +390,7 @@ async def delete_cow(farm_id: str, cow_id: str):
             "raw_files_deleted": raw_files_deleted,
             "muzzle_folder_deleted": not os.path.exists(muzzle_folder),
             "muzzle_files_deleted": muzzle_files_deleted,
-            "remaining_cows_in_database": len(database.get("labels", []))
+            "remaining_cows_in_database": len(set(database.get("labels", [])))
         }
         
     except Exception as e:
