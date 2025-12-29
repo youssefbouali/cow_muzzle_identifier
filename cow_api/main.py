@@ -30,21 +30,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Charger la base de données locale au démarrage
-database = load_database()
-logging.info(f"Base de données chargée avec {len(database.get('labels', []))} vaches")
+# Cache des bases de données par exploitation
+databases_cache = {}
 
-# Créer les dossiers nécessaires
-os.makedirs("data/prediction_results", exist_ok=True)
-os.makedirs("data/raw_images", exist_ok=True)
-os.makedirs("data/muzzle_images", exist_ok=True)
+def validate_farm_exists(farm_id: str):
+    """Valide qu'une exploitation existe, retourne une réponse d'erreur si elle n'existe pas"""
+    if not db_manager.farm_exists(farm_id):
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": f"Exploitation '{farm_id}' introuvable",
+                "farm_id": farm_id,
+                "message": "Cette exploitation n'existe pas. Utilisez GET /farms pour voir les exploitations disponibles ou ajoutez une vache avec POST /add-cow pour créer une nouvelle exploitation."
+            }
+        )
+    return None
+
+def get_farm_database(farm_id: str):
+    """Charge ou récupère la base de données d'une exploitation depuis le cache"""
+    if farm_id not in databases_cache:
+        databases_cache[farm_id] = load_database(farm_id)
+        logging.info(f"Base de données chargée pour l'exploitation {farm_id}: {len(databases_cache[farm_id].get('labels', []))} vaches")
+    return databases_cache[farm_id]
+
+def get_farm_folders(farm_id: str):
+    """Retourne les chemins des dossiers pour une exploitation"""
+    return {
+        "base": f"data/farms/{farm_id}",
+        "prediction_results": f"data/farms/{farm_id}/prediction_results",
+        "raw_images": f"data/farms/{farm_id}/raw_images",
+        "muzzle_images": f"data/farms/{farm_id}/muzzle_images"
+    }
+
+# Créer le dossier de base pour les exploitations
+os.makedirs("data/farms", exist_ok=True)
 
 @app.post("/add-cow")
 async def add_cow(
+    farm_id: str = Form(...),
     cow_id: str = Form(...),
     images: List[UploadFile] = File(...)
 ):
-    global database
     embeddings = []
 
     try:
@@ -53,13 +79,18 @@ async def add_cow(
                 "error": "Aucune image fournie"
             })
 
-        logging.info(f"Traitement de {len(images)} images pour la vache {cow_id}")
+        logging.info(f"Traitement de {len(images)} images pour la vache {cow_id} de l'exploitation {farm_id}")
 
+        # Récupérer la base de données de l'exploitation
+        database = get_farm_database(farm_id)
+        folders = get_farm_folders(farm_id)
+        
         # Créer les dossiers pour cette vache
-        raw_images_folder = f"data/raw_images/{cow_id}"
-        muzzle_folder = f"data/muzzle_images/{cow_id}"
+        raw_images_folder = os.path.join(folders["raw_images"], cow_id)
+        muzzle_folder = os.path.join(folders["muzzle_images"], cow_id)
         os.makedirs(raw_images_folder, exist_ok=True)
         os.makedirs(muzzle_folder, exist_ok=True)
+        os.makedirs(folders["prediction_results"], exist_ok=True)
 
         muzzle_count = 0
         images_saved = 0
@@ -103,11 +134,16 @@ async def add_cow(
             database["labels"].append(cow_id)
             database["embeddings"].append(emb.tolist())
         
+        # Mettre à jour le cache
+        databases_cache[farm_id] = database
+        
         # Sauvegarder localement
-        save_success = save_database(database)
+        save_success = save_database(database, farm_id)
         
         return {
-            "message": f"✅ Vache {cow_id} ajoutée avec {len(embeddings)} images valides (museau détecté).",
+            "message": f"✅ Vache {cow_id} ajoutée avec {len(embeddings)} images valides (museau détecté) à l'exploitation {farm_id}.",
+            "farm_id": farm_id,
+            "cow_id": cow_id,
             "images_uploaded": len(images),
             "images_saved": images_saved,
             "images_with_muzzle_detected": len(embeddings),
@@ -119,21 +155,29 @@ async def add_cow(
         }
 
     except Exception as e:
-        logging.error(f"Erreur lors du traitement de la vache {cow_id}: {e}")
+        logging.error(f"Erreur lors du traitement de la vache {cow_id} pour l'exploitation {farm_id}: {e}")
         return JSONResponse(status_code=500, content={
-            "error": f"Erreur lors du traitement: {str(e)}"
+            "error": f"Erreur lors du traitement: {str(e)}",
+            "farm_id": farm_id,
+            "cow_id": cow_id
         })
 
 
 
 @app.post("/predict")
-async def predict(image: UploadFile = File(...)):
-    global database
+async def predict(
+    farm_id: str = Form(...),
+    image: UploadFile = File(...)
+):
+    # Valider que l'exploitation existe
+    farm_error = validate_farm_exists(farm_id)
+    if farm_error:
+        return farm_error
+    
     filename_only = os.path.basename(image.filename)
     temp_path = f"temp_{filename_only}"
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(image.file, buffer)
-
 
     # Détection du museau
     muzzle_img = detect_muzzle(temp_path)
@@ -144,13 +188,19 @@ async def predict(image: UploadFile = File(...)):
         return JSONResponse({
             "prediction": "MUSEAU NON DÉTECTÉ",
             "score": 0,
+            "farm_id": farm_id,
             "muzzle_saved": False
         })
+    
+    # Récupérer la base de données de l'exploitation
+    database = get_farm_database(farm_id)
+    folders = get_farm_folders(farm_id)
     
     # Générer un nom de fichier unique avec timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # microseconds tronquées
     muzzle_filename = f"prediction_{timestamp}_{filename_only}"
-    muzzle_save_path = os.path.join("data/prediction_results", muzzle_filename)
+    muzzle_save_path = os.path.join(folders["prediction_results"], muzzle_filename)
+    os.makedirs(folders["prediction_results"], exist_ok=True)
     
     # Sauvegarder l'image du museau détecté
     cv2.imwrite(muzzle_save_path, muzzle_img)
@@ -164,16 +214,18 @@ async def predict(image: UploadFile = File(...)):
         return JSONResponse({
             "prediction": "BASE DE DONNÉES VIDE",
             "score": 0.0,
+            "farm_id": farm_id,
             "muzzle_saved": True,
             "muzzle_save_path": muzzle_save_path,
             "original_filename": filename_only,
-            "message": "Aucune vache enregistrée dans la base de données. Ajoutez des vaches avec /add-cow avant de faire des prédictions.",
+            "message": f"Aucune vache enregistrée dans la base de données de l'exploitation {farm_id}. Ajoutez des vaches avec /add-cow avant de faire des prédictions.",
             "total_cows_in_database": len(database.get("labels", []))
         })
 
     return JSONResponse({
         "prediction": label,
         "score": float(score),
+        "farm_id": farm_id,
         "muzzle_saved": True,
         "muzzle_save_path": muzzle_save_path,
         "original_filename": filename_only,
@@ -181,15 +233,21 @@ async def predict(image: UploadFile = File(...)):
     })
 
 
-@app.get("/cow/{cow_id}/raw-images")
-async def get_cow_raw_images(cow_id: str):
+@app.get("/farm/{farm_id}/cow/{cow_id}/raw-images")
+async def get_cow_raw_images(farm_id: str, cow_id: str):
     """Récupère la liste des images brutes d'une vache stockées localement"""
-    raw_folder = f"data/raw_images/{cow_id}"
+    # Valider que l'exploitation existe
+    farm_error = validate_farm_exists(farm_id)
+    if farm_error:
+        return farm_error
+    
+    folders = get_farm_folders(farm_id)
+    raw_folder = os.path.join(folders["raw_images"], cow_id)
     
     if not os.path.exists(raw_folder):
         return JSONResponse(
             status_code=404,
-            content={"error": f"Aucune image brute trouvée pour la vache {cow_id}"}
+            content={"error": f"Aucune image brute trouvée pour la vache {cow_id} de l'exploitation {farm_id}"}
         )
     
     try:
@@ -197,6 +255,7 @@ async def get_cow_raw_images(cow_id: str):
         raw_files.sort()
         
         return {
+            "farm_id": farm_id,
             "cow_id": cow_id,
             "raw_images_count": len(raw_files),
             "raw_folder": raw_folder,
@@ -209,15 +268,21 @@ async def get_cow_raw_images(cow_id: str):
         )
 
 
-@app.get("/cow/{cow_id}/muzzle-images")
-async def get_cow_muzzle_images(cow_id: str):
+@app.get("/farm/{farm_id}/cow/{cow_id}/muzzle-images")
+async def get_cow_muzzle_images(farm_id: str, cow_id: str):
     """Récupère la liste des images de museaux sauvegardées localement"""
-    muzzle_folder = f"data/muzzle_images/{cow_id}"
+    # Valider que l'exploitation existe
+    farm_error = validate_farm_exists(farm_id)
+    if farm_error:
+        return farm_error
+    
+    folders = get_farm_folders(farm_id)
+    muzzle_folder = os.path.join(folders["muzzle_images"], cow_id)
     
     if not os.path.exists(muzzle_folder):
         return JSONResponse(
             status_code=404,
-            content={"error": f"Aucune image de museau trouvée pour la vache {cow_id}"}
+            content={"error": f"Aucune image de museau trouvée pour la vache {cow_id} de l'exploitation {farm_id}"}
         )
     
     try:
@@ -225,6 +290,7 @@ async def get_cow_muzzle_images(cow_id: str):
         muzzle_files.sort()  # Tri par nom
         
         return {
+            "farm_id": farm_id,
             "cow_id": cow_id,
             "muzzle_images_count": len(muzzle_files),
             "muzzle_folder": muzzle_folder,
@@ -237,12 +303,19 @@ async def get_cow_muzzle_images(cow_id: str):
         )
 
 
-@app.delete("/cow/{cow_id}")
-async def delete_cow(cow_id: str):
-    """Supprime une vache et toutes ses images de la base de données d'embeddings"""
-    global database
+@app.delete("/farm/{farm_id}/cow/{cow_id}")
+async def delete_cow(farm_id: str, cow_id: str):
+    """Supprime une vache et toutes ses images de la base de données d'embeddings d'une exploitation"""
+    # Valider que l'exploitation existe
+    farm_error = validate_farm_exists(farm_id)
+    if farm_error:
+        return farm_error
     
     try:
+        # Récupérer la base de données de l'exploitation
+        database = get_farm_database(farm_id)
+        folders = get_farm_folders(farm_id)
+        
         # Vérifier si la vache existe dans la base de données
         labels = database.get("labels", [])
         embeddings = database.get("embeddings", [])
@@ -250,14 +323,14 @@ async def delete_cow(cow_id: str):
         if cow_id not in labels:
             return JSONResponse(
                 status_code=404,
-                content={"error": f"Vache {cow_id} non trouvée dans la base de données"}
+                content={"error": f"Vache {cow_id} non trouvée dans la base de données de l'exploitation {farm_id}"}
             )
         
         # Trouver l'index de la vache dans la base de données
         cow_index = labels.index(cow_id)
         
         # Créer une sauvegarde avant suppression
-        backup_path = db_manager.backup_database()
+        backup_path = db_manager.backup_database(farm_id)
         if not backup_path:
             logging.warning("Impossible de créer une sauvegarde avant suppression")
         
@@ -265,15 +338,18 @@ async def delete_cow(cow_id: str):
         labels.pop(cow_index)
         embeddings.pop(cow_index)
         
-        # Mettre à jour la base de données globale
+        # Mettre à jour la base de données
         database["labels"] = labels
         database["embeddings"] = embeddings
         
+        # Mettre à jour le cache
+        databases_cache[farm_id] = database
+        
         # Sauvegarder la base de données mise à jour
-        save_success = save_database(database)
+        save_success = save_database(database, farm_id)
         
         # Supprimer le dossier local des images brutes
-        raw_folder = f"data/raw_images/{cow_id}"
+        raw_folder = os.path.join(folders["raw_images"], cow_id)
         raw_files_deleted = 0
         if os.path.exists(raw_folder):
             try:
@@ -285,7 +361,7 @@ async def delete_cow(cow_id: str):
                 logging.warning(f"Impossible de supprimer le dossier {raw_folder}: {e}")
         
         # Supprimer le dossier local des images de museaux
-        muzzle_folder = f"data/muzzle_images/{cow_id}"
+        muzzle_folder = os.path.join(folders["muzzle_images"], cow_id)
         muzzle_files_deleted = 0
         if os.path.exists(muzzle_folder):
             try:
@@ -297,7 +373,8 @@ async def delete_cow(cow_id: str):
                 logging.warning(f"Impossible de supprimer le dossier {muzzle_folder}: {e}")
         
         return {
-            "message": f"✅ Vache {cow_id} supprimée avec succès",
+            "message": f"✅ Vache {cow_id} supprimée avec succès de l'exploitation {farm_id}",
+            "farm_id": farm_id,
             "cow_id": cow_id,
             "embedding_removed": True,
             "database_saved": save_success,
@@ -321,17 +398,25 @@ async def delete_cow(cow_id: str):
         )
 
 
-@app.get("/cows")
-async def list_all_cows():
-    """Liste toutes les vaches présentes dans la base de données d'embeddings"""
+@app.get("/farm/{farm_id}/cows")
+async def list_all_cows(farm_id: str):
+    """Liste toutes les vaches présentes dans la base de données d'embeddings d'une exploitation"""
+    # Valider que l'exploitation existe
+    farm_error = validate_farm_exists(farm_id)
+    if farm_error:
+        return farm_error
+    
     try:
+        database = get_farm_database(farm_id)
+        folders = get_farm_folders(farm_id)
+        
         labels = database.get("labels", [])
         embeddings = database.get("embeddings", [])
         
         cows_info = []
         for i, cow_id in enumerate(labels):
             # Vérifier si le dossier de museaux existe localement
-            muzzle_folder = f"data/muzzle_images/{cow_id}"
+            muzzle_folder = os.path.join(folders["muzzle_images"], cow_id)
             muzzle_files_count = 0
             if os.path.exists(muzzle_folder):
                 muzzle_files = [f for f in os.listdir(muzzle_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
@@ -346,13 +431,42 @@ async def list_all_cows():
             })
         
         return {
+            "farm_id": farm_id,
             "total_cows": len(labels),
             "cows": cows_info,
             "database_status": "loaded" if len(labels) > 0 else "empty"
         }
         
     except Exception as e:
-        logging.error(f"Erreur lors de la récupération de la liste des vaches: {e}")
+        logging.error(f"Erreur lors de la récupération de la liste des vaches pour {farm_id}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Erreur lors de la récupération: {str(e)}", "farm_id": farm_id}
+        )
+
+
+@app.get("/farms")
+async def list_all_farms():
+    """Liste toutes les exploitations enregistrées"""
+    try:
+        farms = db_manager.list_all_farms()
+        
+        farms_info = []
+        for farm_id in farms:
+            db_info = db_manager.get_database_info(farm_id)
+            farms_info.append({
+                "farm_id": farm_id,
+                "total_cows": db_info.get("total_cows", 0),
+                "total_embeddings": db_info.get("total_embeddings", 0),
+                "database_exists": db_info.get("exists", False)
+            })
+        
+        return {
+            "total_farms": len(farms),
+            "farms": farms_info
+        }
+    except Exception as e:
+        logging.error(f"Erreur lors de la récupération de la liste des exploitations: {e}")
         return JSONResponse(
             status_code=500,
             content={"error": f"Erreur lors de la récupération: {str(e)}"}
@@ -362,61 +476,84 @@ async def list_all_cows():
 @app.get("/health")
 async def health_check():
     """Vérification de l'état de l'API"""
-    # Informations sur la base de données
-    db_info = db_manager.get_database_info()
+    farms = db_manager.list_all_farms()
+    total_cows = 0
+    
+    for farm_id in farms:
+        db = get_farm_database(farm_id)
+        total_cows += len(db.get("labels", []))
     
     return {
         "api_status": "OK",
-        "database_loaded": len(database.get("labels", [])) > 0,
-        "database_info": db_info,
-        "total_cows_in_database": len(database.get("labels", []))
+        "total_farms": len(farms),
+        "total_cows_all_farms": total_cows,
+        "farms": farms
     }
 
 
-@app.get("/database/info")
-async def get_database_info():
-    """Informations détaillées sur la base de données"""
-    db_info = db_manager.get_database_info()
+@app.get("/farm/{farm_id}/database/info")
+async def get_database_info(farm_id: str):
+    """Informations détaillées sur la base de données d'une exploitation"""
+    # Valider que l'exploitation existe
+    farm_error = validate_farm_exists(farm_id)
+    if farm_error:
+        return farm_error
+    
+    database = get_farm_database(farm_id)
+    db_info = db_manager.get_database_info(farm_id)
     
     return {
+        "farm_id": farm_id,
         "total_cows": len(database.get("labels", [])),
         "cow_ids": database.get("labels", []),
-        "storage_location": db_manager.db_path,
+        "storage_location": db_manager.get_farm_db_path(farm_id),
         "database_details": db_info
     }
 
 
-@app.post("/database/backup")
-async def create_database_backup():
-    """Créer une sauvegarde manuelle de la base de données"""
-    backup_path = db_manager.backup_database()
+@app.post("/farm/{farm_id}/database/backup")
+async def create_database_backup(farm_id: str):
+    """Créer une sauvegarde manuelle de la base de données d'une exploitation"""
+    # Valider que l'exploitation existe
+    farm_error = validate_farm_exists(farm_id)
+    if farm_error:
+        return farm_error
+    
+    backup_path = db_manager.backup_database(farm_id)
     if backup_path:
         return {
             "message": "Backup créé avec succès",
+            "farm_id": farm_id,
             "backup_location": backup_path
         }
     else:
         return JSONResponse(
             status_code=500,
-            content={"error": "Échec de la création du backup"}
+            content={"error": "Échec de la création du backup", "farm_id": farm_id}
         )
 
 
-@app.post("/database/reload")
-async def reload_database():
-    """Recharge la base de données depuis le fichier local"""
-    global database
+@app.post("/farm/{farm_id}/database/reload")
+async def reload_database(farm_id: str):
+    """Recharge la base de données d'une exploitation depuis le fichier local"""
+    # Valider que l'exploitation existe
+    farm_error = validate_farm_exists(farm_id)
+    if farm_error:
+        return farm_error
+    
     try:
-        database = load_database()
+        database = load_database(farm_id)
+        databases_cache[farm_id] = database
         return {
-            "message": "Base de données rechargée depuis le fichier local",
+            "message": f"Base de données rechargée depuis le fichier local pour l'exploitation {farm_id}",
+            "farm_id": farm_id,
             "total_cows": len(database.get("labels", [])),
             "cow_ids": database.get("labels", [])
         }
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"error": f"Erreur lors du rechargement: {str(e)}"}
+            content={"error": f"Erreur lors du rechargement: {str(e)}", "farm_id": farm_id}
         )
 
 
