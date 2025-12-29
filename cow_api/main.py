@@ -98,10 +98,10 @@ async def add_cow(
                 "images_saved": images_saved
             })
 
-        # Moyenne des embeddings et sauvegarde dans la base de données locale
-        avg_embedding = np.mean(embeddings, axis=0)
-        database["labels"].append(cow_id)
-        database["embeddings"].append(avg_embedding.tolist())
+        # Sauvegarder chaque embedding individuellement avec l'ID de la vache
+        for emb in embeddings:
+            database["labels"].append(cow_id)
+            database["embeddings"].append(emb.tolist())
         
         # Sauvegarder localement
         save_success = save_database(database)
@@ -157,7 +157,7 @@ async def predict(image: UploadFile = File(...)):
     logging.info(f"Museau détecté sauvegardé: {muzzle_save_path}")
     
     img_tensor = preprocess_image(muzzle_img)
-    label, score = predict_identity(img_tensor, database, threshold=0.7)
+    label, score = predict_identity(img_tensor, database, threshold=0.6)
 
     # Gestion du cas où la base de données est vide
     if label == "BASE_VIDE":

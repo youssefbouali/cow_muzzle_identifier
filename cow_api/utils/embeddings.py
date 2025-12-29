@@ -42,10 +42,13 @@ def predict_identity(img_tensor, database, threshold=0.7):
         return "BASE_VIDE", 0.0
     
     query_emb = get_embedding(img_tensor)
+    # Calculer la similarité avec tous les embeddings
     sims = cosine_similarity([query_emb], database["embeddings"])[0]
     best_score = float(np.max(sims))
     best_index = int(np.argmax(sims))
+    
     if best_score < threshold:
         return "INCONNUE", best_score
     else:
+        # Retourner le label correspondant à l'embedding le plus similaire
         return database["labels"][best_index], best_score
