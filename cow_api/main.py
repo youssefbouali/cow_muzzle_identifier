@@ -13,15 +13,15 @@ from dotenv import load_dotenv
 from datetime import datetime
 from typing import List
 
-# Charger les variables d'environnement
+# Load environment variables
 load_dotenv()
 
-# Configuration des logs
+# Logger configuration
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 
-# Configuration CORS
+# CORS configuration
 app.add_middleware( 
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,31 +30,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache des bases de données par exploitation
+# Database cache per farm
 databases_cache = {}
 
 def validate_farm_exists(farm_id: str):
-    """Valide qu'une exploitation existe, retourne une réponse d'erreur si elle n'existe pas"""
+    """Validates that a farm exists, returns an error response if not"""
     if not db_manager.farm_exists(farm_id):
         return JSONResponse(
             status_code=404,
             content={
-                "error": f"Exploitation '{farm_id}' introuvable",
+                "error": f"Farm '{farm_id}' not found",
                 "farm_id": farm_id,
-                "message": "Cette exploitation n'existe pas. Utilisez GET /farms pour voir les exploitations disponibles ou ajoutez une vache avec POST /add-cow pour créer une nouvelle exploitation."
+                "message": "This farm does not exist. Use GET /farms to see available farms or add a cow with POST /add-cow to create a new farm."
             }
         )
     return None
 
 def get_farm_database(farm_id: str):
-    """Charge ou récupère la base de données d'une exploitation depuis le cache"""
+    """Loads or retrieves a farm's database from the cache"""
     if farm_id not in databases_cache:
         databases_cache[farm_id] = load_database(farm_id)
-        logging.info(f"Base de données chargée pour l'exploitation {farm_id}: {len(databases_cache[farm_id].get('labels', []))} vaches")
+        logging.info(f"Database loaded for farm {farm_id}: {len(databases_cache[farm_id].get('labels', []))} cows")
     return databases_cache[farm_id]
 
 def get_farm_folders(farm_id: str):
-    """Retourne les chemins des dossiers pour une exploitation"""
+    """Returns folder paths for a farm"""
     return {
         "base": f"data/farms/{farm_id}",
         "prediction_results": f"data/farms/{farm_id}/prediction_results",
@@ -62,7 +62,7 @@ def get_farm_folders(farm_id: str):
         "muzzle_images": f"data/farms/{farm_id}/muzzle_images"
     }
 
-# Créer le dossier de base pour les exploitations
+# Create base folder for farms
 os.makedirs("data/farms", exist_ok=True)
 
 @app.post("/add-cow")
@@ -79,13 +79,13 @@ async def add_cow(
                 "error": "Aucune image fournie"
             })
 
-        logging.info(f"Traitement de {len(images)} images pour la vache {cow_id} de l'exploitation {farm_id}")
+        logging.info(f"Processing {len(images)} images for cow {cow_id} at farm {farm_id}")
 
-        # Récupérer la base de données de l'exploitation
+        # Get farm database
         database = get_farm_database(farm_id)
         folders = get_farm_folders(farm_id)
         
-        # Créer les dossiers pour cette vache
+        # Create folders for this cow
         raw_images_folder = os.path.join(folders["raw_images"], cow_id)
         muzzle_folder = os.path.join(folders["muzzle_images"], cow_id)
         os.makedirs(raw_images_folder, exist_ok=True)
@@ -97,60 +97,58 @@ async def add_cow(
         total_embeddings_created = 0
         
         for i, image in enumerate(images):
-            # Sauvegarder l'image brute
+            # Save raw image
             raw_image_path = os.path.join(raw_images_folder, f"{cow_id}_{i:03d}_{image.filename}")
             with open(raw_image_path, "wb") as buffer:
                 shutil.copyfileobj(image.file, buffer)
             images_saved += 1
-            logging.info(f"Image brute sauvegardée: {raw_image_path}")
+            logging.info(f"Raw image saved: {raw_image_path}")
 
-            # Détecter le museau
+            # Detect muzzle
             muzzle_img = detect_muzzle(raw_image_path)
             if muzzle_img is None:
-                logging.info(f"Museau non détecté dans l'image {image.filename}")
+                logging.info(f"Muzzle not detected in image {image.filename}")
                 continue
 
-            # Générer des augmentations (Original, Flip, Gauche, Droite)
-            augmented_images = generate_augmentations(muzzle_img)
-            
-            aug_labels = ["original", "flipped", "left_view", "right_view"]
+            # Generate augmentations (Original, Flip, 3D Rotation)
+            augmented_images, aug_labels = generate_augmentations(muzzle_img)
             
             for idx, aug_img in enumerate(augmented_images):
-                # Sauvegarder l'image du museau (originale ou augmentée)
-                aug_type = aug_labels[idx] if idx < len(aug_labels) else f"aug_{idx}"
+                # Save muzzle image (original or augmented)
+                aug_type = aug_labels[idx]
                 muzzle_filename = f"muzzle_{cow_id}_{muzzle_count:03d}_{aug_type}.jpg"
                 muzzle_path = os.path.join(muzzle_folder, muzzle_filename)
                 cv2.imwrite(muzzle_path, aug_img)
                 
-                # Extraire l'embedding
+                # Extract embedding
                 img_tensor = preprocess_image(aug_img)
                 emb = get_embedding(img_tensor)
                 embeddings.append(emb)
                 
                 muzzle_count += 1
                 total_embeddings_created += 1
-                logging.info(f"Embedding extrait pour augmentation: {aug_type}")
+                logging.info(f"Embedding extracted for augmentation: {aug_type}")
 
         if len(embeddings) == 0:
             return JSONResponse(status_code=400, content={
-                "error": "Aucune image valide (museau non détecté) trouvée.",
+                "error": "No valid image (muzzle not detected) found.",
                 "images_uploaded": len(images),
                 "images_saved": images_saved
             })
 
-        # Sauvegarder chaque embedding individuellement avec l'ID de la vache
+        # Save each embedding individually with cow ID
         for emb in embeddings:
             database["labels"].append(cow_id)
             database["embeddings"].append(emb.tolist())
         
-        # Mettre à jour le cache
+        # Update cache
         databases_cache[farm_id] = database
         
-        # Sauvegarder localement
+        # Save locally
         save_success = save_database(database, farm_id)
         
         return {
-            "message": f"✅ Vache {cow_id} ajoutée avec {total_embeddings_created} signatures (incluant augmentations 3D) pour {images_saved} images traitées.",
+            "message": f"✅ Cow {cow_id} added with {total_embeddings_created} signatures (including 3D augmentations) for {images_saved} images processed.",
             "farm_id": farm_id,
             "cow_id": cow_id,
             "images_uploaded": len(images),
@@ -163,9 +161,9 @@ async def add_cow(
         }
 
     except Exception as e:
-        logging.error(f"Erreur lors du traitement de la vache {cow_id} pour l'exploitation {farm_id}: {e}")
+        logging.error(f"Error processing cow {cow_id} for farm {farm_id}: {e}")
         return JSONResponse(status_code=500, content={
-            "error": f"Erreur lors du traitement: {str(e)}",
+            "error": f"Error during processing: {str(e)}",
             "farm_id": farm_id,
             "cow_id": cow_id
         })
@@ -177,7 +175,7 @@ async def predict(
     farm_id: str = Form(...),
     image: UploadFile = File(...)
 ):
-    # Valider que l'exploitation existe
+    # Validate farm exists
     farm_error = validate_farm_exists(farm_id)
     if farm_error:
         return farm_error
@@ -187,46 +185,46 @@ async def predict(
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(image.file, buffer)
 
-    # Détection du museau
+    # Muzzle detection
     muzzle_img = detect_muzzle(temp_path)
 
     os.remove(temp_path)
 
     if muzzle_img is None:
         return JSONResponse({
-            "prediction": "MUSEAU NON DÉTECTÉ",
+            "prediction": "MUZZLE NOT DETECTED",
             "score": 0,
             "farm_id": farm_id,
             "muzzle_saved": False
         })
     
-    # Récupérer la base de données de l'exploitation
+    # Get farm database
     database = get_farm_database(farm_id)
     folders = get_farm_folders(farm_id)
     
-    # Générer un nom de fichier unique avec timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # microseconds tronquées
+    # Generate unique filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # truncated microseconds
     muzzle_filename = f"prediction_{timestamp}_{filename_only}"
     muzzle_save_path = os.path.join(folders["prediction_results"], muzzle_filename)
     os.makedirs(folders["prediction_results"], exist_ok=True)
     
-    # Sauvegarder l'image du museau détecté
+    # Save detected muzzle image
     cv2.imwrite(muzzle_save_path, muzzle_img)
-    logging.info(f"Museau détecté sauvegardé: {muzzle_save_path}")
+    logging.info(f"Detected muzzle saved: {muzzle_save_path}")
     
     img_tensor = preprocess_image(muzzle_img)
     label, score = predict_identity(img_tensor, database, threshold=0.6)
 
-    # Gestion du cas où la base de données est vide
+    # Handling case where database is empty
     if label == "BASE_VIDE":
         return JSONResponse({
-            "prediction": "BASE DE DONNÉES VIDE",
+            "prediction": "EMPTY DATABASE",
             "score": 0.0,
             "farm_id": farm_id,
             "muzzle_saved": True,
             "muzzle_save_path": muzzle_save_path,
             "original_filename": filename_only,
-            "message": f"Aucune vache enregistrée dans la base de données de l'exploitation {farm_id}. Ajoutez des vaches avec /add-cow avant de faire des prédictions.",
+            "message": f"No cows registered in farm {farm_id} database. Add cows with /add-cow before predicting.",
             "total_cows_in_database": len(database.get("labels", []))
         })
 
