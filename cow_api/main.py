@@ -39,9 +39,9 @@ def validate_farm_exists(farm_id: str):
         return JSONResponse(
             status_code=404,
             content={
-                "error": f"Farm '{farm_id}' not found",
+                "error": f"Exploitation '{farm_id}' introuvable",
                 "farm_id": farm_id,
-                "message": "This farm does not exist. Use GET /farms to see available farms or add a cow with POST /add-cow to create a new farm."
+                "message": "Cette exploitation n'existe pas. Utilisez GET /farms pour voir les exploitations disponibles ou ajoutez une vache avec POST /add-cow pour créer une nouvelle exploitation."
             }
         )
     return None
@@ -131,7 +131,7 @@ async def add_cow(
 
         if len(embeddings) == 0:
             return JSONResponse(status_code=400, content={
-                "error": "No valid image (muzzle not detected) found.",
+                "error": "Aucune image valide (museau non détecté) trouvée.",
                 "images_uploaded": len(images),
                 "images_saved": images_saved
             })
@@ -148,7 +148,7 @@ async def add_cow(
         save_success = save_database(database, farm_id)
         
         return {
-            "message": f"✅ Cow {cow_id} added with {total_embeddings_created} signatures (including 3D augmentations) for {images_saved} images processed.",
+            "message": f"✅ Vache {cow_id} ajoutée avec {total_embeddings_created} signatures (incluant augmentations 3D) pour {images_saved} images traitées.",
             "farm_id": farm_id,
             "cow_id": cow_id,
             "images_uploaded": len(images),
@@ -163,7 +163,7 @@ async def add_cow(
     except Exception as e:
         logging.error(f"Error processing cow {cow_id} for farm {farm_id}: {e}")
         return JSONResponse(status_code=500, content={
-            "error": f"Error during processing: {str(e)}",
+            "error": f"Erreur lors du traitement: {str(e)}",
             "farm_id": farm_id,
             "cow_id": cow_id
         })
@@ -192,7 +192,7 @@ async def predict(
 
     if muzzle_img is None:
         return JSONResponse({
-            "prediction": "MUZZLE NOT DETECTED",
+            "prediction": "MUSEAU NON DÉTECTÉ",
             "score": 0,
             "farm_id": farm_id,
             "muzzle_saved": False
@@ -218,13 +218,13 @@ async def predict(
     # Handling case where database is empty
     if label == "BASE_VIDE":
         return JSONResponse({
-            "prediction": "EMPTY DATABASE",
+            "prediction": "BASE DE DONNÉES VIDE",
             "score": 0.0,
             "farm_id": farm_id,
             "muzzle_saved": True,
             "muzzle_save_path": muzzle_save_path,
             "original_filename": filename_only,
-            "message": f"No cows registered in farm {farm_id} database. Add cows with /add-cow before predicting.",
+            "message": f"Aucune vache enregistrée dans la base de données de l'exploitation {farm_id}. Ajoutez des vaches avec /add-cow avant de faire des prédictions.",
             "total_cows_in_database": len(database.get("labels", []))
         })
 
