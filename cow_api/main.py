@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import shutil
 import numpy as np
-from utils.image_utils import preprocess_image, detect_muzzle
+from utils.image_utils import preprocess_image, detect_muzzle, generate_augmentations
 from utils.embeddings import get_embedding, predict_identity
 from utils.local_database import db_manager, load_database, save_database
 import cv2
@@ -94,6 +94,7 @@ async def add_cow(
 
         muzzle_count = 0
         images_saved = 0
+        total_embeddings_created = 0
         
         for i, image in enumerate(images):
             # Sauvegarder l'image brute
@@ -109,18 +110,26 @@ async def add_cow(
                 logging.info(f"Museau non détecté dans l'image {image.filename}")
                 continue
 
-            # Sauvegarder l'image du museau
-            muzzle_filename = f"muzzle_{cow_id}_{muzzle_count:03d}.jpg"
-            muzzle_path = os.path.join(muzzle_folder, muzzle_filename)
-            cv2.imwrite(muzzle_path, muzzle_img)
-            muzzle_count += 1
-            logging.info(f"Museau sauvegardé: {muzzle_path}")
-
-            # Extraire l'embedding
-            img_tensor = preprocess_image(muzzle_img)
-            emb = get_embedding(img_tensor)
-            embeddings.append(emb)
-            logging.info(f"Embedding extrait de {image.filename}")
+            # Générer des augmentations (Original, Flip, Gauche, Droite)
+            augmented_images = generate_augmentations(muzzle_img)
+            
+            aug_labels = ["original", "flipped", "left_view", "right_view"]
+            
+            for idx, aug_img in enumerate(augmented_images):
+                # Sauvegarder l'image du museau (originale ou augmentée)
+                aug_type = aug_labels[idx] if idx < len(aug_labels) else f"aug_{idx}"
+                muzzle_filename = f"muzzle_{cow_id}_{muzzle_count:03d}_{aug_type}.jpg"
+                muzzle_path = os.path.join(muzzle_folder, muzzle_filename)
+                cv2.imwrite(muzzle_path, aug_img)
+                
+                # Extraire l'embedding
+                img_tensor = preprocess_image(aug_img)
+                emb = get_embedding(img_tensor)
+                embeddings.append(emb)
+                
+                muzzle_count += 1
+                total_embeddings_created += 1
+                logging.info(f"Embedding extrait pour augmentation: {aug_type}")
 
         if len(embeddings) == 0:
             return JSONResponse(status_code=400, content={
@@ -141,16 +150,15 @@ async def add_cow(
         save_success = save_database(database, farm_id)
         
         return {
-            "message": f"✅ Vache {cow_id} ajoutée avec {len(embeddings)} images valides (museau détecté) à l'exploitation {farm_id}.",
+            "message": f"✅ Vache {cow_id} ajoutée avec {total_embeddings_created} signatures (incluant augmentations 3D) pour {images_saved} images traitées.",
             "farm_id": farm_id,
             "cow_id": cow_id,
             "images_uploaded": len(images),
             "images_saved": images_saved,
-            "images_with_muzzle_detected": len(embeddings),
-            "embeddings_extracted": len(embeddings),
+            "total_embeddings": total_embeddings_created,
+            "augmentations_per_image": len(augmented_images) if 'augmented_images' in locals() else 0,
             "raw_images_folder": raw_images_folder,
             "muzzle_images_folder": muzzle_folder,
-            "muzzle_files_count": muzzle_count,
             "database_saved": save_success
         }
 
